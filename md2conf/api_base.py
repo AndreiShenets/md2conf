@@ -38,7 +38,7 @@ from .api_types import (
     ConfluenceVersion,
 )
 from .compatibility import override
-from .environment import ArgumentError, ConfluenceAPIVersionMismatch, ConfluenceError, PageError
+from .environment import ArgumentError, ConfluenceError, PageError
 from .metadata import ConfluenceSiteMetadata
 from .options_api import ConfluenceSessionOptions
 from .serializer import JsonType, json_to_object, object_to_json_payload
@@ -65,6 +65,13 @@ def build_url(base_url: str, query: dict[str, str] | None = None) -> str:
 
     url_parts = (scheme, netloc, path, None, urlencode(query) if query else None, None)
     return urlunparse(url_parts)
+
+
+def path_or_data(attachment_path: Path | None = None, raw_data: bytes | None = None) -> None:
+    if attachment_path is None and raw_data is None:
+        raise ArgumentError("required: `attachment_path` or `raw_data`")
+    elif attachment_path is not None and raw_data is not None:
+        raise ArgumentError("expected: either `attachment_path` or `raw_data`")
 
 
 @overload
@@ -144,39 +151,6 @@ class ConfluenceSession(ABC):
         """
         ...
 
-    @property
-    def supports_folders(self) -> bool:
-        """Whether this Confluence API supports folders in the content tree."""
-
-        return False
-
-    def get_folder_properties(self, folder_id: str) -> ConfluenceFolderProperties:
-        """Retrieves a Confluence folder by its explicitly identified folder ID."""
-
-        raise ConfluenceAPIVersionMismatch("Confluence folders require REST API v2")
-
-    def get_folder_properties_by_title(self, title: str, *, parent_id: ConfluenceTypedID) -> ConfluenceFolderProperties | None:
-        """Finds a direct child folder with a matching title."""
-
-        raise ConfluenceAPIVersionMismatch("Confluence folders require REST API v2")
-
-    def create_folder(self, *, title: str, parent_id: str, space_id: str) -> ConfluenceFolderProperties:
-        """Creates a folder in the Confluence content tree."""
-
-        raise ConfluenceAPIVersionMismatch("Confluence folders require REST API v2")
-
-    def get_or_create_folder(self, title: str, parent_id: ConfluenceTypedID) -> ConfluenceFolderProperties:
-        """Finds a direct child folder with the given title, or creates it."""
-
-        folder = self.get_folder_properties_by_title(title, parent_id=parent_id)
-        if folder is not None:
-            LOGGER.debug("Retrieving existing folder: %s", folder.id)
-            return folder
-
-        LOGGER.debug("Creating new folder with title: %s", title)
-        space_id = self.get_object_space_id(parent_id)
-        return self.create_folder(title=title, parent_id=parent_id.id, space_id=space_id)
-
     @abstractmethod
     def get_users(self, expr: str) -> list[ConfluenceUser]:
         """
@@ -215,7 +189,6 @@ class ConfluenceSession(ABC):
     @abstractmethod
     def supports_attachment_content_properties(self) -> bool:
         """Whether attachment content properties are available in this Confluence API."""
-
         ...
 
     @abstractmethod
@@ -227,7 +200,6 @@ class ConfluenceSession(ABC):
         :param key: The name of the property to fetch (with case-sensitive match).
         :returns: The content property value, or `None` if not found.
         """
-
         ...
 
     @abstractmethod
@@ -238,8 +210,31 @@ class ConfluenceSession(ABC):
         :param attachment_id: The attachment ID.
         :param property: Content property data to assign.
         """
-
         ...
+
+    @overload
+    def upload_attachment(
+        self,
+        page_id: str,
+        attachment_name: str,
+        *,
+        attachment_path: Path | None = None,
+        content_type: str | None = None,
+        comment: str | None = None,
+        force: bool = False,
+    ) -> None: ...
+
+    @overload
+    def upload_attachment(
+        self,
+        page_id: str,
+        attachment_name: str,
+        *,
+        raw_data: bytes | None = None,
+        content_type: str | None = None,
+        comment: str | None = None,
+        force: bool = False,
+    ) -> None: ...
 
     @abstractmethod
     def upload_attachment(
@@ -264,8 +259,40 @@ class ConfluenceSession(ABC):
         :param comment: Attachment description.
         :param force: Overwrite an existing attachment even if there seem to be no changes.
         """
-
         ...
+
+    @property
+    @abstractmethod
+    def supports_folders(self) -> bool:
+        """Whether this Confluence API supports folders in the content tree."""
+        ...
+
+    @abstractmethod
+    def get_folder_properties(self, folder_id: str) -> ConfluenceFolderProperties:
+        """Retrieves a Confluence folder by its explicitly identified folder ID."""
+        ...
+
+    @abstractmethod
+    def get_folder_properties_by_title(self, title: str, *, parent_id: ConfluenceTypedID) -> ConfluenceFolderProperties | None:
+        """Finds a direct child folder with a matching title."""
+        ...
+
+    @abstractmethod
+    def create_folder(self, *, title: str, parent_id: str, space_id: str) -> ConfluenceFolderProperties:
+        """Creates a folder in the Confluence content tree."""
+        ...
+
+    def get_or_create_folder(self, title: str, parent_id: ConfluenceTypedID) -> ConfluenceFolderProperties:
+        """Finds a direct child folder with the given title, or creates it."""
+
+        folder = self.get_folder_properties_by_title(title, parent_id=parent_id)
+        if folder is not None:
+            LOGGER.debug("Retrieving existing folder: %s", folder.id)
+            return folder
+
+        LOGGER.debug("Creating new folder with title: %s", title)
+        space_id = self.get_object_space_id(parent_id)
+        return self.create_folder(title=title, parent_id=parent_id.id, space_id=space_id)
 
     @abstractmethod
     def get_page_properties_by_title(self, title: str, *, space_id: str | None = None, space_key: str | None = None) -> ConfluencePageProperties:
@@ -781,11 +808,7 @@ class ConfluenceSessionShared(ConfluenceSession):
         comment: str | None = None,
         force: bool = False,
     ) -> None:
-        if attachment_path is None and raw_data is None:
-            raise ArgumentError("required: `attachment_path` or `raw_data`")
-
-        if attachment_path is not None and raw_data is not None:
-            raise ArgumentError("expected: either `attachment_path` or `raw_data`")
+        path_or_data(attachment_path=attachment_path, raw_data=raw_data)
 
         if content_type is None:
             if attachment_path is not None:
@@ -812,7 +835,7 @@ class ConfluenceSessionShared(ConfluenceSession):
                     LOGGER.info("Up-to-date embedded file: %s", attachment_name)
                     return
             else:
-                raise NotImplementedError("parameter match not exhaustive")
+                raise AssertionError("parameter match not exhaustive")
 
             id = attachment.id.removeprefix("att")
             path = f"/content/{page_id}/child/attachment/{id}/data"
@@ -877,7 +900,7 @@ class ConfluenceSessionShared(ConfluenceSession):
                 verify=True,
             )
         else:
-            raise NotImplementedError("parameter match not exhaustive")
+            raise AssertionError("parameter match not exhaustive")
 
         response.raise_for_status()
         data = response.json()

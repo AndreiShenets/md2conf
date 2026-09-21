@@ -10,9 +10,10 @@ import hashlib
 import logging
 from dataclasses import dataclass, fields
 from pathlib import Path
+from typing import overload
 
 from . import __version__
-from .api_base import ConfluenceSession
+from .api_base import ConfluenceSession, path_or_data
 from .api_types import (
     ConfluenceCommentStatus,
     ConfluenceContentProperty,
@@ -224,7 +225,7 @@ class SynchronizingProcessor(Processor):
         if not self.api.supports_folders:
             for node in root.all():
                 if node.is_folder:
-                    raise ConfluenceAPIVersionMismatch(f"Confluence folders require REST API v2 when synchronizing {node.absolute_path}")
+                    raise ConfluenceAPIVersionMismatch(f"expected: folders enabled when synchronizing {node.absolute_path}")
 
     @override
     def _synchronize_structure(self, tree: DocumentNode) -> dict[str, list[str]]:
@@ -588,6 +589,16 @@ class SynchronizingProcessor(Processor):
             # re-apply content state last to avoid clearing it when updating the body or content properties
             self.api.set_content_state(page.id, content_state)
 
+    @overload
+    def _synchronize_attachment(
+        self, page_id: str, attachment_id: str | None, attachment_name: str, *, attachment_path: Path | None = None, comment: str | None = None
+    ) -> None: ...
+
+    @overload
+    def _synchronize_attachment(
+        self, page_id: str, attachment_id: str | None, attachment_name: str, *, raw_data: bytes | None = None, comment: str | None = None
+    ) -> None: ...
+
     def _synchronize_attachment(
         self,
         page_id: str,
@@ -600,47 +611,43 @@ class SynchronizingProcessor(Processor):
     ) -> None:
         """Synchronizes an attachment using a checksum when the API supports content properties."""
 
-        if attachment_path is None and raw_data is None:
-            raise ArgumentError("required: `attachment_path` or `raw_data`")
-        if attachment_path is not None and raw_data is not None:
-            raise ArgumentError("expected: either `attachment_path` or `raw_data`")
+        path_or_data(attachment_path=attachment_path, raw_data=raw_data)
 
-        if not self.api.supports_attachment_content_properties:
-            self.api.upload_attachment(page_id, attachment_name, attachment_path=attachment_path, raw_data=raw_data, comment=comment)
-            return
+        if self.api.supports_attachment_content_properties:
+            digest = hashlib.md5()
+            if attachment_path is not None:
+                if not attachment_path.is_file():
+                    raise PageError(f"file not found: {attachment_path}")
+                with attachment_path.open("rb") as attachment_file:
+                    while chunk := attachment_file.read(1024 * 1024):
+                        digest.update(chunk)
+            elif raw_data is not None:
+                digest.update(raw_data)
+            else:
+                raise AssertionError("parameter match not exhaustive")
 
-        digest = hashlib.md5()
-        if attachment_path is not None:
-            if not attachment_path.is_file():
-                raise PageError(f"file not found: {attachment_path}")
-            with attachment_path.open("rb") as attachment_file:
-                while chunk := attachment_file.read(1024 * 1024):
-                    digest.update(chunk)
-        elif raw_data is not None:
-            digest.update(raw_data)
+            source_digest = digest.hexdigest()
+            if attachment_id is not None:
+                property = self.api.get_content_property_for_attachment(attachment_id, CONTENT_PROPERTY_TAG)
+                if property is not None and property.value == source_digest:
+                    LOGGER.info("Up-to-date attachment (matching checksum): %s", attachment_name)
+                    return
+
+            force = True
         else:
-            raise AssertionError("parameter match not exhaustive")
+            force = False
 
-        source_digest = digest.hexdigest()
-        if attachment_id is not None:
-            property = self.api.get_content_property_for_attachment(attachment_id, CONTENT_PROPERTY_TAG)
-            if property is not None and property.value == source_digest:
-                LOGGER.info("Up-to-date attachment (matching checksum): %s", attachment_name)
-                return
+        if attachment_path is not None:
+            self.api.upload_attachment(page_id, attachment_name, attachment_path=attachment_path, comment=comment, force=force)
+        elif raw_data is not None:
+            self.api.upload_attachment(page_id, attachment_name, raw_data=raw_data, comment=comment, force=force)
 
-        self.api.upload_attachment(
-            page_id,
-            attachment_name,
-            attachment_path=attachment_path,
-            raw_data=raw_data,
-            comment=comment,
-            force=True,
-        )
-        attachment = self.api.get_attachment_by_name(page_id, attachment_name)
-        self.api.update_content_property_for_attachment(
-            attachment.id,
-            ConfluenceContentProperty(CONTENT_PROPERTY_TAG, source_digest),
-        )
+        if self.api.supports_attachment_content_properties:
+            attachment = self.api.get_attachment_by_name(page_id, attachment_name)
+            self.api.update_content_property_for_attachment(
+                attachment.id,
+                ConfluenceContentProperty(CONTENT_PROPERTY_TAG, source_digest),  # pyright: ignore[reportPossiblyUnboundVariable]
+            )
 
     def _has_changes(
         self, page: ConfluencePage, tag: ConfluenceMarkdownTag | None, title: str, tree: ElementType, root: ElementType, source_digest: str
@@ -735,7 +742,7 @@ class SynchronizingProcessor(Processor):
             closing_index = -1
 
         if closing_index >= 0:
-            index = closing_index + len(closing_marker)
+            index = closing_index + len(closing_marker)  # pyright: ignore[reportPossiblyUnboundVariable]
             if document[index : index + 1] == "\n":
                 index += 1
 
